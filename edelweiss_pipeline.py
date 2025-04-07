@@ -19,6 +19,7 @@ def Logger(log_file):
 log_file = "goallm_v7"
 model = "gpt-4o-2024-11-20"
 #model = "gpt-4o-mini-2024-07-18"
+smart_model = "chatgpt-4o-latest"
 api_key = getpass.getpass("Enter your OpenAI API Key: ")
 n_prev, topk_episodic = 5, 2
 max_steps, n_attempts = 20, 1  # 최대 턴 수를 20으로 설정 (예시)
@@ -33,7 +34,7 @@ log = Logger(log_file)
 # 에이전트 생성
 agent = GPTagent(model=model, system_prompt=default_system_prompt, api_key=api_key)
 agent_plan = GPTagent(model=model, system_prompt=system_plan_agent, api_key=api_key)
-agent_action = GPTagent(model=model, system_prompt=system_action_agent, api_key=api_key)
+agent_action = GPTagent(model=smart_model, system_prompt=system_action_agent, api_key=api_key)
 
 # 초기 plan_agent 출력 예시 (최초 계획)
 initial_plan0 = f'''{{
