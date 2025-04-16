@@ -2,9 +2,12 @@
 Pipeline from AriGraph's Graph RAG
 
 Overal Pipeline is below
-![GOALLM_v7-Overview drawio (2)](https://github.com/user-attachments/assets/a34102ac-9631-46d8-b111-b78cd442141b)
+
+![GOALLM_v7-Overview](https://github.com/user-attachments/assets/6e5e3b58-c81e-428f-be1f-8afca9d824f8)
+
 
 More detailed pipeline is below
-![GOALLM_v7-Pipeline drawio](https://github.com/user-attachments/assets/414ad271-b43c-4cad-a546-acd124c1ab6d)
+
+![GOALLM_v7-Pipeline](https://github.com/user-attachments/assets/5b4e1574-941a-4f80-8873-cbc6e72d87a8)
 
 Memory system is key feature. It control information.
