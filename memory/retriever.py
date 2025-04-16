@@ -1,21 +1,83 @@
-from sentence_transformers import SentenceTransformer
 import torch
+import torch.nn.functional as F
 from collections import OrderedDict
-
+import numpy as np
+from sentence_transformers import SentenceTransformer, models
 
 # 전역 캐시 (LRU 방식)
 embedding_cache = OrderedDict()
 CACHE_SIZE = 100  # 캐싱할 최대 임베딩 개수
 
+# 각 모델별 설정 (Hugging Face Model Hub 기준)
+MODEL_CONFIGS = {
+    "paraphrase-multilingual-mpnet-base-v2": {
+        "load_direct": True,
+        "model_name": "paraphrase-multilingual-mpnet-base-v2"
+    },
+    "LaBSE": {
+        "load_direct": True,
+        "model_name": "sentence-transformers/LaBSE"
+    },
+    "multilingual-e5-large-instruct": {
+        "load_direct": False,
+        "model_name": "intfloat/multilingual-e5-large",
+        "pooling": "mean",         # 평균 풀링 사용
+        "max_seq_length": 512      # 최대 시퀀스 길이
+    },
+    "BGE-M3": {
+        "load_direct": False,
+        "model_name": "BAAI/bge-m3",
+        "pooling": "cls",          # CLS 토큰 풀링 사용
+        "max_seq_length": 8192
+    },
+    "Nomic-Embed": {
+        "load_direct": False,
+        "model_name": "nomic-ai/nomic-embed-text-v1",
+        "pooling": "mean",         # 평균 풀링 사용
+        "max_seq_length": 8192
+    }
+}
 
 class Retriever:
     """
-    Sentence-BERT를 기반으로 문장 임베딩을 생성하는 클래스.
-    또한 key와 query 임베딩 간의 유사도 계산을 통해 상위 결과를 반환하는 search_in_embeds 메서드를 제공합니다.
+    Sentence-Transformer 기반 임베딩 생성 및 코사인 유사도 계산을 통해 결과를 리턴하는 클래스.
+
+    모델은 MODEL_CONFIGS의 설정에 따라 Hugging Face Transformer와 Pooling을 조합하여 로드됩니다.
     """
-    def __init__(self, device='cpu', model_name='sentence-transformers/all-MiniLM-L6-v2'):
+    def __init__(self, device='cpu', model_key='paraphrase-multilingual-mpnet-base-v2'):
         self.device = device
-        self.embedder = SentenceTransformer(model_name, device=device)
+        config = MODEL_CONFIGS.get(model_key)
+        if config is None:
+            raise ValueError(f"Model key '{model_key}' is not defined in MODEL_CONFIGS.")
+        if config.get("load_direct", False):
+            # 이미 SentenceTransformer 형식인 모델이면 바로 로드
+            self.embedder = SentenceTransformer(config["model_name"], device=device)
+        else:
+            # Transformer + Pooling 조합으로 SentenceTransformer 구성
+            transformer = models.Transformer(
+                model_name_or_path=config["model_name"],
+                max_seq_length=config.get("max_seq_length", 256),
+                device=device
+            )
+            pooling_mode = config.get("pooling", "mean")
+            if pooling_mode == "mean":
+                pooling = models.Pooling(
+                    transformer.get_word_embedding_dimension(),
+                    pooling_mode_mean_tokens=True,
+                    pooling_mode_cls_token=False
+                )
+            elif pooling_mode == "cls":
+                pooling = models.Pooling(
+                    transformer.get_word_embedding_dimension(),
+                    pooling_mode_cls_token=True
+                )
+            else:
+                pooling = models.Pooling(
+                    transformer.get_word_embedding_dimension(),
+                    pooling_mode_mean_tokens=True,
+                    pooling_mode_cls_token=False
+                )
+            self.embedder = SentenceTransformer(modules=[transformer, pooling])
 
     def embed(self, texts):
         """
@@ -29,16 +91,17 @@ class Retriever:
     @torch.no_grad()
     def search_in_embeds(self, key_embeds, query_embeds, topk: int = None, similarity_threshold: float = None,
                          return_embeds: bool = False, return_scores: bool = False):
-
         """
-        key_embeds와 query_embeds 간의 유사도를 계산하여,
-        topk 개의 가장 유사한 결과(또는 similarity_threshold 이상의 결과)를 반환합니다.
+        key_embeds와 query_embeds 간의 코사인 유사도를 계산하여,
+        topk 또는 similarity_threshold 조건에 맞는 결과를 반환합니다.
         """
         if int(topk is None) + int(similarity_threshold is None) != 1:
             raise ValueError("You should specify either topk or similarity_threshold but not both!")
 
-        # 마지막 두 차원을 전치하도록 수정
-        scores = query_embeds @ key_embeds.transpose(-1, -2)  # shape: (M, N)
+        query_embeds_norm = F.normalize(query_embeds, p=2, dim=-1)
+        key_embeds_norm = F.normalize(key_embeds, p=2, dim=-1)
+        scores = query_embeds_norm @ key_embeds_norm.transpose(-1, -2)  # shape: (M, N)
+
         batch_request = len(query_embeds.shape) > 1
         if not batch_request:
             scores = scores.reshape(1, -1)
@@ -70,22 +133,14 @@ class Retriever:
             result = {k: v[0] for k, v in result.items()}
         return result
 
-
-
-
-
 def get_cached_embeddings(texts, retriever):
     """
     주어진 문자열 리스트에 대해 캐시된 임베딩이 있으면 사용하고,
-    없는 경우 Retriever.embed()를 통해 계산한 후 캐싱합니다.
-    :param texts: 임베딩을 구할 문자열 리스트
-    :param retriever: Retriever 인스턴스
-    :return: (num_texts, embed_dim) 크기의 텐서
+    없는 경우 Retriever.embed()를 통해 계산 후 캐싱합니다.
     """
     results = [None] * len(texts)
     texts_to_compute = []
     indices_to_compute = []
-
     for i, text in enumerate(texts):
         if text in embedding_cache:
             embedding_cache.move_to_end(text)
@@ -93,7 +148,6 @@ def get_cached_embeddings(texts, retriever):
         else:
             texts_to_compute.append(text)
             indices_to_compute.append(i)
-
     if texts_to_compute:
         computed = retriever.embed(texts_to_compute)
         for idx, text, emb in zip(indices_to_compute, texts_to_compute, computed):
@@ -101,56 +155,8 @@ def get_cached_embeddings(texts, retriever):
             embedding_cache[text] = emb
             if len(embedding_cache) > CACHE_SIZE:
                 embedding_cache.popitem(last=False)
-
     return torch.stack(results)
 
-
-"""
-@torch.no_grad()
-def graph_retr_search(start_query, triplets, retriever, max_depth: int = 2,
-                      topk: int = 3, post_retrieve_threshold: float = 0.7,
-                      verbose: int = 2):
-    # triplets 임베딩 (2차원 텐서: (N, embed_dim))
-    key_embeds = get_cached_embeddings(triplets, retriever)
-
-    current_level = [start_query]
-    depth = {start_query: 0}
-    result = []
-    visited = set([start_query])
-
-    while current_level:
-        query_embeds = get_cached_embeddings(current_level, retriever)
-        # query_embeds가 1차원일 경우 2차원으로 변환
-        if query_embeds.ndim == 1:
-            query_embeds = query_embeds.unsqueeze(0)
-
-        # 마지막 두 차원만 전치하여 (M, N) 형태의 유사도 행렬 계산
-        scores = query_embeds @ key_embeds.transpose(-1, -2)
-        effective_topk = min(topk, scores.shape[1])
-        topk_values, topk_indices = scores.topk(effective_topk, dim=1)
-
-        next_level = []
-        for i, query in enumerate(current_level):
-            for score, idx in zip(topk_values[i].tolist(), topk_indices[i].tolist()):
-                if score < post_retrieve_threshold:
-                    continue
-                triplet = triplets[idx]
-                parts = [part.strip() for part in triplet.split(",")]
-                if len(parts) < 3:
-                    continue
-                v1, relation, v2 = parts[:3]
-                for v in [v1, v2]:
-                    if v not in visited and depth[query] < max_depth:
-                        visited.add(v)
-                        next_level.append(v)
-                        depth[v] = depth[query] + 1
-                if triplet not in result:
-                    result.append(triplet)
-                if verbose >= 2:
-                    print(f"[Depth {depth[query]}] Query: '{query}' -> Triplet: '{triplet}' (Score: {score:.3f})")
-        current_level = next_level
-    return result
-"""
 
 @torch.no_grad()
 def graph_retr_search(start_triplet, triplets, retriever, max_depth: int = 2,
@@ -158,34 +164,22 @@ def graph_retr_search(start_triplet, triplets, retriever, max_depth: int = 2,
                       verbose: int = 2):
     """
     시작 쿼리(triplet)를 기반으로 주어진 triplets에서 BFS 방식으로 관련 결과를 탐색합니다.
-    쿼리와 후보 모두 "v1, relation, v2" 형식의 문자열이며, 임베딩을 통해 전체 문맥을 비교합니다.
-
-    :param start_triplet: 시작 트리플릿 문자열 (예: "user, is in, operations conference barracks")
-    :param triplets: 후보 트리플릿 문자열들의 리스트
-    :param retriever: Retriever 인스턴스
-    :param max_depth: 최대 탐색 깊이 (현재 트리플릿에서 확장할 수 있는 단계)
-    :param topk: 각 쿼리마다 고려할 상위 k개 후보
-    :param post_retrieve_threshold: 유사도 임계치 (이 값 미만인 후보는 무시)
-    :param verbose: 디버그 출력을 위한 출력 레벨 (2 이상이면 상세 출력)
-    :return: 조건에 맞는 트리플릿 문자열들의 리스트
     """
-    # 후보 트리플릿 임베딩 (2차원 텐서: (N, embed_dim))
     key_embeds = get_cached_embeddings(triplets, retriever)
-
-    current_level = [start_triplet]  # 검색 쿼리(트리플릿) 리스트
+    current_level = [start_triplet]  # 탐색 시작 쿼리 리스트
     depth = {start_triplet: 0}         # 각 트리플릿의 탐색 깊이 기록
     result = set()                   # 최종 검색된 트리플릿 집합
-    visited = set([start_triplet])   # 중복 검색 방지를 위한 방문 집합
+    visited = set([start_triplet])   # 중복 검색 방지를 위한 집합
 
     while current_level:
         query_embeds = get_cached_embeddings(current_level, retriever)
         if query_embeds.ndim == 1:
             query_embeds = query_embeds.unsqueeze(0)
-        # 안전하게 마지막 두 차원을 전치하여 유사도 행렬 계산
-        scores = query_embeds @ key_embeds.transpose(-1, -2)
+        query_embeds_norm = F.normalize(query_embeds, p=2, dim=-1)
+        key_embeds_norm = F.normalize(key_embeds, p=2, dim=-1)
+        scores = query_embeds_norm @ key_embeds_norm.transpose(-1, -2)
         effective_topk = min(topk, scores.shape[1])
         topk_values, topk_indices = scores.topk(effective_topk, dim=1)
-
         next_level = []
         for i, query in enumerate(current_level):
             current_depth = depth[query]
@@ -195,26 +189,106 @@ def graph_retr_search(start_triplet, triplets, retriever, max_depth: int = 2,
                 candidate_triplet = triplets[idx]
                 if candidate_triplet in visited:
                     continue
-                # 후보 트리플릿을 결과에 추가하고, 아직 깊이 제한 안에 있다면 확장 대상으로 포함
                 result.add(candidate_triplet)
                 if current_depth < max_depth:
                     next_level.append(candidate_triplet)
                     depth[candidate_triplet] = current_depth + 1
                     visited.add(candidate_triplet)
-                if verbose >= 2:
-                    print(f"[Depth {current_depth}] Query: '{query}' -> Triplet: '{candidate_triplet}' (Score: {score:.3f})")
         current_level = next_level
     return list(result)
 
+def find_top_episodic_emb(A, B, obs_plan_embedding, retriever):
+    results = {}
+    if not B:
+        return results
+    # B 딕셔너리의 각 value[1]을 스택하여 (N, embed_dim) 텐서 생성
+    key_embeddings = torch.stack([value[1] for value in B.values()])
+
+    # obs_plan_embedding이 1차원일 경우 2차원으로 변경
+    if obs_plan_embedding.ndim == 1:
+        obs_plan_embedding = obs_plan_embedding.unsqueeze(0)
+
+    # Retriever를 이용해 모든 항목에 대해 유사도 계산 (topk로 모든 결과 반환)
+    similarity_results = retriever.search_in_embeds(
+        key_embeds=key_embeddings,
+        query_embeds=obs_plan_embedding,
+        topk=len(B),
+        return_scores=True
+    )
+
+    similarity_results = sort_scores(similarity_results)
+
+    # similarity_scores가 중첩된 리스트라면 플래튼 처리
+    if similarity_results.get('scores'):
+        similarity_scores = similarity_results['scores']
+        if isinstance(similarity_scores[0], list):
+            similarity_scores = similarity_scores[0]
+    else:
+        similarity_scores = [0] * len(B)
+
+    max_similarity_score = max(similarity_scores, default=0)
+    # max_similarity_score가 0이 아닌 경우 각 스코어를 정규화
+    similarity_scores = [score / max_similarity_score if max_similarity_score else 0 for score in similarity_scores]
+
+    # A의 요소와 B의 각 value_list 간의 매칭 횟수를 계산
+    match_counts = [sum(1 for element in A if element in value_list) for _, (value_list, _) in B.items()]
+
+    match_counts_relative = []
+    for i, values in enumerate(B.values()):
+        # values[0]는 에피소드의 요소 리스트라고 가정합니다.
+        match_counts_relative.append((match_counts[i] / (len(values[0]) + 1e-9)) * np.log((len(values[0]) + 1e-9)))
+
+    max_match_count = max(match_counts_relative, default=0)
+    normalized_match_scores = [count / max_match_count if max_match_count else 0 for count in match_counts_relative]
+
+    # 결과 딕셔너리에 각 에피소드의 정규화된 match score와 similarity score 할당
+    for idx, (key, _) in enumerate(B.items()):
+        results[key] = [normalized_match_scores[idx], similarity_scores[idx]]
+    return results
 
 
+def filter_items_by_similarity(data, query, threshold, retriever, max_n):
+    """
+    각 (주제, 내용) 항목을 "주제: 내용" 문자열로 결합하여 임베딩한 뒤,
+    query와의 코사인 유사도가 threshold 이상인 항목을 (주제, 내용, score) 형태로 반환합니다.
+    최대 max_n개 항목만 반환합니다.
+    """
+    texts = [f"{subject}: {content}" for subject, content in data]
+    key_embeds = get_cached_embeddings(texts, retriever)
+    query_embed = get_cached_embeddings([query], retriever)
+    key_embeds_norm = F.normalize(key_embeds, p=2, dim=-1)
+    query_embed_norm = F.normalize(query_embed, p=2, dim=-1)
+    similarities = (key_embeds_norm @ query_embed_norm.transpose(-1, -2)).squeeze(1).cpu().numpy()
+    filtered_items = []
+    for i, score in enumerate(similarities):
+        if score >= threshold:
+            filtered_items.append((data[i][0], data[i][1], score))
+    filtered_items = sorted(filtered_items, key=lambda x: x[2], reverse=True)
+    return filtered_items[:max_n]
 
-# Example usage:
+# ==== 예제 테스트 코드 ====
 if __name__ == "__main__":
-    # Retriever 인스턴스 초기화 (예: GPU 사용 시 device='cuda')
-    my_retriever = Retriever(device='cpu')
+    # Retriever 인스턴스 생성: 모델 키는 원하시는 대로 선택하세요.
+    # 여기서는 기본값인 'paraphrase-multilingual-mpnet-base-v2'를 사용합니다.
+    retriever = Retriever(device='cpu',model_key='paraphrase-multilingual-mpnet-base-v2')  # 다른 모델: model_key='LaBSE', 'multilingual-e5-large-instruct', 'BGE-M3', 'Nomic-Embed'
 
-    # 예시 triplets (각 문자열은 "v1, relation, v2" 형식)
+    # --- 1. find_top_episodic_emb 예제 ---
+    print("=== find_top_episodic_emb 예제 ===")
+    obs_plan_text = ["The user is at the conference barracks"]
+    obs_plan_embedding = retriever.embed(obs_plan_text)
+    A = ["user", "conference", "barracks"]
+    B = {
+        "episode_1": (["user", "conference", "room"], retriever.embed(["User attended a meeting in the conference room"])[0]),
+        "episode_2": (["user", "barracks", "sleeping"], retriever.embed(["User was sleeping in the barracks"])[0]),
+        "episode_3": (["user", "cafeteria", "eating"], retriever.embed(["User was eating in the cafeteria"])[0])
+    }
+    episodic_results = find_top_episodic_emb(A, B, obs_plan_embedding, retriever)
+    for episode, scores in episodic_results.items():
+        match_score, similarity_score = scores
+        print(f"{episode}: match_score={match_score:.3f}, similarity_score={similarity_score:.3f}")
+
+    # --- 2. graph_retr_search 예제 ---
+    print("\n=== graph_retr_search 예제 ===")
     triplets = [
         "apple, is a, fruit",
         "fruit, can be, eaten",
@@ -222,12 +296,24 @@ if __name__ == "__main__":
         "apple, is related to, banana",
         "orange, is a, fruit",
     ]
-
-    start_query = "apple"
-
-    results = graph_retr_search(start_query, triplets, my_retriever,
-                                max_depth=3, topk=3, post_retrieve_threshold=0.55, verbose=1)
-
-    print("\nGraph Search Results:")
-    for r in results:
+    start_triplet = "apple, is a, fruit"
+    graph_results = graph_retr_search(start_triplet, triplets, retriever,
+                                      max_depth=3, topk=3, post_retrieve_threshold=0.55, verbose=1)
+    for r in graph_results:
         print(r)
+
+    # --- 3. filter_items_by_similarity 예제 ---
+    print("\n=== filter_items_by_similarity 예제 ===")
+    data = [
+        ("스포츠", "축구는 전 세계적으로 사랑받는 스포츠입니다."),
+        ("기술", "인공지능은 현대 기술 발전의 핵심 동력입니다."),
+        ("요리", "다양한 파스타 요리 레시피를 소개합니다."),
+        ("과학", "양자 물리학은 미시 세계를 탐구합니다."),
+        ("AI", "인공지능은 인공적인 지능입니다")
+    ]
+    query = "AI와 머신러닝의 최신 동향"
+    threshold = 0.4
+    filtered = filter_items_by_similarity(data, query, threshold, retriever, max_n=3)
+    print("임계치 이상의 항목:")
+    for item in filtered:
+        print(item)
