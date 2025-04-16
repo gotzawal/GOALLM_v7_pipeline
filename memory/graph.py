@@ -9,6 +9,10 @@ from openai import OpenAI
 # from utils.utils import clear_triplet, check_conn, find_relation
 # (또한 prompt_extraction_current, prompt_refining_items, process_triplets, parse_triplets_removing,
 #  graph_retr_search, find_top_episodic_emb, top_k_obs 등 필요한 함수 및 상수들이 이미 정의되었다고 가정)
+from retriever import Retriever, graph_retr_search, find_top_episodic_emb
+from utils import clear_triplet, process_triplets, parse_triplets_removing, top_k_obs
+from memory_prompts import prompt_refining_items, prompt_extraction_current
+
 
 class ContrieverGraph:
     def __init__(self, model, system_prompt, api_key, device="cpu", debug=False):
